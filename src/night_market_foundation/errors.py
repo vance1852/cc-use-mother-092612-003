@@ -33,3 +33,10 @@ class ConflictError(DomainError):
 
     code = "conflict"
     status = 409
+
+
+class PreconditionFailed(DomainError):
+    """开项前置条件失效或安全状态不允许当前动作。"""
+
+    code = "precondition_failed"
+    status = 412

@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .safety import SafetyService
 from .service import DomainService
 from .storage import Database
 
@@ -17,10 +18,19 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
           headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
+    return route_services(service, None, method, path, body, headers)
+
+
+def route_services(service: DomainService, safety: SafetyService | None, method: str,
+                   path: str, body: dict[str, Any] | None,
+                   headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    """把请求分派到基础服务与安全记录服务。"""
+
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    segments = [segment for segment in parsed.path.split("/") if segment]
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -48,6 +58,12 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if safety is None:
+            return 404, {"error": "route_not_found", "message": "接口不存在"}
+        result = _route_safety(safety, method, segments, parsed, body, actor_id)
+        if result is not None:
+            status, payload, replayed = result
+            return (200 if replayed else 201) if method == "POST" else status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -55,10 +71,69 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+def _route_safety(safety: SafetyService, method: str, segments: list[str], parsed,
+                  body: dict[str, Any], actor_id: str):
+    query = parse_qs(parsed.query)
+    if method == "POST":
+        if segments == ["procedures"]:
+            payload = safety.publish_procedure(actor_id=actor_id, **body)
+            replayed = payload.get("replayed", False)
+            return 201, payload, replayed
+        if segments == ["qualifications"]:
+            payload = safety.grant_qualification(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["qualifications", "revoke"]:
+            payload = safety.revoke_qualification(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["screenings"]:
+            payload = safety.record_screening(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["equipment-batches"]:
+            payload = safety.register_equipment_batch(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["equipment-loans"]:
+            payload = safety.loan_equipment(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["equipment-returns"]:
+            payload = safety.return_equipment(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["safety-sessions", "start"]:
+            payload = safety.start_session(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["safety-sessions", "facts"]:
+            payload = safety.append_session_fact(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["safety-sessions", "complete"]:
+            payload = safety.complete_session(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["incidents"]:
+            payload = safety.report_incident(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+        if segments == ["review-items", "resolve"]:
+            payload = safety.resolve_review_item(actor_id=actor_id, **body)
+            return 201, payload, payload.get("replayed", False)
+    if method == "GET":
+        if len(segments) == 3 and segments[0] == "safety-sessions" and segments[2] == "trace":
+            return 200, safety.session_trace(segments[1]), False
+        if len(segments) == 2 and segments[0] == "incidents":
+            return 200, safety.get_incident(segments[1]), False
+        if segments == ["review-items"]:
+            incident_no = query.get("incident_no", [None])[0]
+            status = query.get("status", [None])[0]
+            return 200, {"items": [item.__dict__ for item in
+                                   safety.list_review_items(incident_no, status)]}, False
+        if segments == ["suspensions"]:
+            status = query.get("status", [None])[0]
+            return 200, {"items": [item.__dict__ for item in
+                                   safety.list_suspensions(status)]}, False
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    safety: SafetyService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -68,8 +143,9 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
-        status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+        status, payload = route_services(
+            self.service, self.safety, self.command, self.path, body,
+            {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +176,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.safety = SafetyService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
